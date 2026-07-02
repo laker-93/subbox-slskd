@@ -1,0 +1,7 @@
+# slskd credential cache written by scripts/run-slskd-* (plaintext — never commit)
+slskd-credentials.env
+*.slskd-credentials.env
+
+# Python
+__pycache__/
+*.py[cod]
