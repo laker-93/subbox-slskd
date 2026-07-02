@@ -5,9 +5,7 @@ Standalone [slskd](https://github.com/slskd/slskd) (Soulseek) tooling for
 instance and auto-download the tracks on your Subbox **wishlist** that you don't
 already own — filling gaps in your library over Soulseek.
 
-They were extracted from the `pymix` backend repo so they can be handed to end
-users without the rest of the platform. They talk to Subbox/pymix, Navidrome and
-slskd purely over their HTTP APIs.
+You can then set up the watch directory on subbox to watch the download directory that downloads from soulseek land in. This will enable subbox to automatically import and missing tracks from your wishlist.
 
 ## Scripts
 
