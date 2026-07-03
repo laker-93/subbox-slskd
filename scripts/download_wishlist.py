@@ -27,6 +27,24 @@ diffing locally -- keeps this cheap on large libraries: it's a handful of indexe
 server-side searches instead of a full-library download plus an O(items x tracks)
 fuzzy scan held in memory.
 
+Every wishlist row is expected to carry a curated artist + title, and a curated field
+is always trusted as-is and searched against Soulseek verbatim -- this script never
+overwrites an artist or title that's already populated. Only a *missing* field is
+filled in, and only enough to plug that gap:
+
+  * For a YouTube-sourced row missing a field, the real "Artist - Title" is often
+    packed into the video title (with the uploading channel left in ``artist``) --
+    so a missing piece is recovered by splitting the title on its " - ".
+  * If a field is still missing (curation failed, or the row was added straight from
+    a link and never curated), the script falls back to the row's source URL
+    (``youtube_url`` / ``bandcamp_url`` / ``soundcloud_url``): it fetches a free-text
+    title via oEmbed, then asks MusicBrainz's recording search -- built to cope with
+    noisy, unstructured strings -- for its best-scoring (artist, title) match.
+
+Pass ``--no-musicbrainz-fallback`` to skip the MusicBrainz step. A row with no
+artist/title *and* no URL (a bare raw-note inbox entry) is always skipped -- there's
+nothing to search on.
+
 It uses only the Python standard library, so it runs with a bare ``python3`` and no
 ``pip install`` -- handy for non-technical users who just need slskd running locally.
 
@@ -267,6 +285,125 @@ def similar(a: str, b: str) -> float:
 
 
 # --------------------------------------------------------------------------- #
+# Fallback: URL -> MusicBrainz, for wishlist rows with no curated artist/title
+# --------------------------------------------------------------------------- #
+# A "wishlist"-status row is supposed to already have artist + title curated (see
+# pymix's WishlistStatus docs), but curation can fail or be skipped, leaving a row
+# with only a source URL. Rather than silently dropping those rows, pull a free-text
+# title off the URL via oEmbed and let MusicBrainz's recording search -- which is
+# built to cope with noisy, unstructured strings -- resolve it to a clean
+# artist/title. Both steps are plain HTTP GET + JSON, so this stays inside the
+# stdlib-only constraint the rest of the script has to honour (no musicbrainzngs,
+# no yt-dlp). Mirrors the approach prototyped in scratch/musicbrainz.py.
+MUSICBRAINZ_URL = "https://musicbrainz.org/ws/2/recording/"
+MUSICBRAINZ_USER_AGENT = "subbox-wishlist-downloader/1.0 ( https://github.com/laker-93/subbox-slskd )"
+
+# oEmbed endpoints for the URL types a wishlist row can carry. Each returns JSON with
+# (at least) `title` and `author_name` via a plain unauthenticated GET.
+_OEMBED_ENDPOINTS = {
+    "youtube_url": "https://www.youtube.com/oembed",
+    "soundcloud_url": "https://soundcloud.com/oembed",
+    "bandcamp_url": "https://bandcamp.com/oembed",
+}
+
+# MusicBrainz asks for no more than one request/second without an API key. This
+# fallback only fires for rows missing both artist and title -- rare -- so a naive
+# process-wide throttle is enough; no need for anything fancier.
+_last_musicbrainz_call = 0.0
+
+
+def _throttle_musicbrainz() -> None:
+    global _last_musicbrainz_call
+    wait = _last_musicbrainz_call + 1.0 - time.monotonic()
+    if wait > 0:
+        time.sleep(wait)
+    _last_musicbrainz_call = time.monotonic()
+
+
+def extract_metadata_text(url: str, url_field: str) -> Optional[str]:
+    """Fetch a free-text description ("uploader title") of `url` via oEmbed.
+
+    Returned as one string so it can be handed straight to MusicBrainz as a search
+    query -- no further parsing is attempted here, since MusicBrainz's own relevance
+    scoring is what disambiguates it.
+    """
+    endpoint = _OEMBED_ENDPOINTS.get(url_field)
+    if not endpoint:
+        return None
+    try:
+        data = http_request("GET", endpoint, params={"url": url, "format": "json"})
+    except RuntimeError as exc:
+        print(f"  ! oEmbed lookup failed for {url}: {exc}")
+        return None
+    if not isinstance(data, dict):
+        return None
+    text = " ".join(p for p in (data.get("author_name"), data.get("title")) if p).strip()
+    return text or None
+
+
+def musicbrainz_best_match(query_text: str) -> Optional[tuple[str, str]]:
+    """Search MusicBrainz recordings for `query_text`, return the best (artist, title).
+
+    MusicBrainz's recording search accepts a free-text query and returns its own
+    relevance `score` (0-100) per hit, so we just sort on that and take the top
+    result -- same approach as the youtube-track-matcher prototype this mirrors.
+    """
+    if not query_text or not query_text.strip():
+        return None
+    _throttle_musicbrainz()
+    try:
+        data = http_request(
+            "GET",
+            MUSICBRAINZ_URL,
+            params={"query": query_text, "fmt": "json", "limit": 5},
+            headers={"User-Agent": MUSICBRAINZ_USER_AGENT},
+        )
+    except RuntimeError as exc:
+        print(f"  ! musicbrainz search failed for {query_text!r}: {exc}")
+        return None
+
+    recordings = (data or {}).get("recordings", []) or []
+    if not recordings:
+        return None
+    recordings.sort(key=lambda r: int(r.get("score", 0) or 0), reverse=True)
+    best = recordings[0]
+
+    title = best.get("title")
+    artist = None
+    credits = best.get("artist-credit") or []
+    if credits:
+        artist = "".join(
+            c.get("name") or (c.get("artist") or {}).get("name", "")
+            for c in credits
+            if isinstance(c, dict)
+        )
+    if not artist or not title:
+        return None
+    return artist, title
+
+
+def resolve_missing_metadata(raw_item: dict) -> tuple[str, str]:
+    """Best-effort (artist, title) for a wishlist row with no curated artist/title.
+
+    Tries each URL field the row carries, in order, extracting a free-text
+    description via oEmbed and asking MusicBrainz for its best-scoring match.
+    Returns ("", "") if nothing resolves -- the caller then skips the row exactly
+    as it did before this fallback existed.
+    """
+    for url_field in ("youtube_url", "bandcamp_url", "soundcloud_url"):
+        url = raw_item.get(url_field)
+        if not url:
+            continue
+        text = extract_metadata_text(url, url_field)
+        if not text:
+            continue
+        match = musicbrainz_best_match(text)
+        if match:
+            return match
+    return "", ""
+
+
+# --------------------------------------------------------------------------- #
 # Data sources
 # --------------------------------------------------------------------------- #
 @dataclass
@@ -282,7 +419,13 @@ class WishItem:
         return " ".join(p for p in (self.artist, self.title) if p).strip()
 
 
-def fetch_wishlist(pymix_url: str, username: Optional[str], session_id: Optional[str], status: str) -> list[WishItem]:
+def fetch_wishlist(
+    pymix_url: str,
+    username: Optional[str],
+    session_id: Optional[str],
+    status: str,
+    use_musicbrainz_fallback: bool = True,
+) -> list[WishItem]:
     """GET {pymix_url}/wishlist filtered by status. Auth via username or session_id."""
     params = {"status": status}
     cookies = None
@@ -299,14 +442,33 @@ def fetch_wishlist(pymix_url: str, username: Optional[str], session_id: Optional
     for it in items:
         artist = (it.get("artist") or "").strip()
         title = (it.get("title") or "").strip()
+
+        # A curated wishlist row's artist/title is authoritative -- never overwrite
+        # a field that's already populated. Fallbacks below only ever *fill in* a
+        # field that's missing, using whichever value they derive for that field.
+        if not artist or not title:
+            # Some YouTube-sourced rows carry the uploading *channel* in `artist`
+            # (not the performer) with the real "Artist - Title" packed into
+            # `title`. Only reach for this when a field is actually missing --
+            # e.g. artist blank, title = "Will Hofbauer - Squito".
+            if it.get("youtube_video_id") or it.get("youtube_url"):
+                derived_artist, derived_title = split_youtube_artist_title(artist, title)
+                artist = artist or derived_artist
+                title = title or derived_title
+
+        if (not artist or not title) and use_musicbrainz_fallback:
+            # Still missing a field: fall back to whatever source URL the row
+            # carries -- pull a free-text title via oEmbed and let MusicBrainz
+            # resolve it. Again, only used to fill the gap, not to replace a
+            # field that's already set.
+            derived_artist, derived_title = resolve_missing_metadata(it)
+            artist = artist or derived_artist
+            title = title or derived_title
+
         if not artist and not title:
-            # raw_note-only inbox rows have nothing to search on; skip.
+            # Nothing to search on -- e.g. a raw_note-only inbox row with no
+            # link, or a lookup that didn't resolve. Skip it.
             continue
-        # YouTube-sourced items carry the channel name in `artist`; the real
-        # "Artist - Title" is in the video title. Recover it so the search
-        # isn't polluted by the channel name (which finds nothing on Soulseek).
-        if it.get("youtube_video_id") or it.get("youtube_url"):
-            artist, title = split_youtube_artist_title(artist, title)
         out.append(
             WishItem(
                 wishlist_id=it.get("wishlist_id", ""),
@@ -672,6 +834,9 @@ def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
                    help="Optional pymix session_id cookie for the wishlist API (Navidrome still needs --username/--password).")
     p.add_argument("--status", default="wishlist",
                    help="Wishlist status to pull (items still wanting acquisition).")
+    p.add_argument("--no-musicbrainz-fallback", action="store_true",
+                   help="Skip rows with no curated artist/title instead of resolving them via "
+                        "their source URL (oEmbed) + MusicBrainz recording search.")
 
     # navidrome (owned-check via Subsonic search)
     p.add_argument("--navidrome-url", default=os.environ.get("NAVIDROME_URL"),
@@ -764,7 +929,10 @@ def run_once(
     """
     # 1. wishlist
     try:
-        wishlist = fetch_wishlist(args.pymix_url, args.username, args.session_id, args.status)
+        wishlist = fetch_wishlist(
+            args.pymix_url, args.username, args.session_id, args.status,
+            use_musicbrainz_fallback=not args.no_musicbrainz_fallback,
+        )
     except RuntimeError as exc:
         print(f"error: failed to fetch wishlist: {exc}", file=sys.stderr)
         return 1

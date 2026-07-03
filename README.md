@@ -45,6 +45,14 @@ them), and flips each item to `downloaded` via the pymix API. pymix's own
 reconcile loop later promotes `downloaded` → `available` once the file is
 imported.
 
+Each wishlist row is searched on its curated artist/title -- a populated field is
+always trusted and never overwritten. If a field is missing (curation failed, or the
+row was added straight from a link) the script tries to fill just that gap: first by
+splitting a YouTube row's video title (which often embeds "Artist - Title"), then, if
+still missing, via the row's source URL -- an oEmbed lookup for a free-text title,
+resolved to an artist/title match through a MusicBrainz recording search. Pass
+`--no-musicbrainz-fallback` to skip the MusicBrainz step.
+
 ## Credentials
 
 The run scripts cache your Soulseek/slskd login in
