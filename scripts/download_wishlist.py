@@ -11,10 +11,14 @@ This script bridges three things:
 For each wishlist item, it asks your Navidrome instance (which serves directly off
 your beets collection) whether the track already exists by searching its index on
 artist/title. Only items with no match are considered missing. For each missing item
-it then searches Soulseek through slskd, picks the best available file, enqueues the
-download and waits for it to finish. slskd writes the file into the directory it's
-configured with (point that at your Subbox watch dir), and Subbox's watch importer
-ingests it from there — this script never touches the download directory itself.
+it then searches Soulseek through slskd, ranks the available files, enqueues the best
+and waits for it to finish. If that source stalls (a queued download behind an offline
+or wedged uploader that never sends a byte) or fails, the script cancels it and falls
+back to the next-best source automatically — skipping the rest of a bad uploader's
+files — and only counts the item as failed once every source is exhausted. slskd writes
+the file into the directory it's configured with (point that at your Subbox watch dir),
+and Subbox's watch importer ingests it from there — this script never touches the
+download directory itself.
 
 Once a file is pulled, this script flips its wishlist item to ``downloaded`` via the
 pymix API (``PATCH /wishlist/{id}``). That's what stops the same track being fetched
@@ -113,8 +117,11 @@ long command lines:
 Use ``--dry-run`` to see what *would* be downloaded without enqueuing anything.
 
 By default the script waits for the enqueued transfers to finish and reports the
-result (slskd writes the files itself); pass ``--no-wait`` to enqueue and exit,
-letting slskd finish them in the background.
+result (slskd writes the files itself), retrying a stalled or failed source against
+the next-best one (``--per-download-timeout`` sets how long a source may make no
+progress before it's abandoned; ``--max-candidates`` caps how many sources to try).
+Pass ``--no-wait`` to enqueue and exit, letting slskd finish them in the background —
+note that skips the fallback, since nothing is watching to detect a stall.
 
 Add ``--watch`` to keep it running: after each pass it sleeps ``--interval`` seconds
 (default 300) and re-checks the wishlist, picking up anything newly added or still
@@ -153,6 +160,18 @@ FORMAT_RANK = {ext: i for i, ext in enumerate(AUDIO_EXTENSIONS)}
 # Set by --insecure: when True, HTTPS requests skip certificate verification. Needed
 # for local dev behind self-signed certs (e.g. *.docker.localhost); never for prod.
 _INSECURE_TLS = False
+
+# Default User-Agent for our HTTP calls. Prod (*.sub-box.net) sits behind Cloudflare,
+# whose managed WAF rules block the stdlib default "Python-urllib/x.y" signature with
+# a 403 (Cloudflare error 1010, "banned based on your browser's signature"). Sending a
+# normal browser UA gets us past that check — the request still authenticates as usual
+# (username query param / session cookie); this only stops the WAF from refusing the
+# client outright. Per-call headers still win (e.g. the MusicBrainz UA below), so this
+# is only applied when a caller hasn't set its own User-Agent.
+_DEFAULT_USER_AGENT = (
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
+)
 
 
 def _ssl_context() -> Optional[ssl.SSLContext]:
@@ -195,6 +214,7 @@ def http_request(
 
     data = None
     headers = dict(headers or {})
+    headers.setdefault("User-Agent", _DEFAULT_USER_AGENT)
     if json_body is not None:
         data = json.dumps(json_body).encode("utf-8")
         headers.setdefault("Content-Type", "application/json")
