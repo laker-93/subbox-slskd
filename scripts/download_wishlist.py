@@ -440,6 +440,15 @@ def fetch_wishlist(
     items = (data or {}).get("items", [])
     out: list[WishItem] = []
     for it in items:
+        # Gate: skip items pymix hasn't finished resolving. A hand-typed artist/title
+        # lands as resolve_state="pending" and is corrected to a canonical MusicBrainz
+        # match by pymix's background resolve loop; downloading it before then would
+        # search Soulseek on the user's typo. "resolved"/"nomatch" are both terminal
+        # (nomatch = pymix tried and gave up, so the user's text is the best we have) and
+        # download-ready; anything else (missing field for older rows) is treated as ready.
+        if it.get("resolve_state") == "pending":
+            continue
+
         artist = (it.get("artist") or "").strip()
         title = (it.get("title") or "").strip()
 
@@ -705,9 +714,26 @@ class Slskd:
             files.extend(directory.get("files", []))
         return files
 
+    def cancel_download(self, username: str, transfer_id: str, *, remove: bool = True) -> None:
+        """Cancel (and by default remove) an in-flight/queued download.
 
-def pick_file(responses: list[dict], item: WishItem, min_file_score: float = 0.6) -> Optional[tuple[str, dict]]:
-    """Choose the best (username, file) for a wishlist item, or None if nothing fits.
+        Used to abandon a stalled source before falling back to another uploader, so
+        slskd stops holding the dead transfer. ``remove=True`` also drops it from the
+        transfer list, keeping the next ``downloads_for`` poll clean. Best-effort:
+        callers treat any error as non-fatal (the fallback proceeds regardless).
+        """
+        params = {"remove": "true"} if remove else None
+        http_request(
+            "DELETE",
+            self._url(f"transfers/downloads/{urllib.parse.quote(username)}/{urllib.parse.quote(transfer_id)}"),
+            params=params,
+            headers=self.headers,
+            timeout=self.timeout,
+        )
+
+
+def rank_files(responses: list[dict], item: WishItem, min_file_score: float = 0.6) -> list[tuple[str, dict]]:
+    """Return every acceptable (username, file) for a wishlist item, best first.
 
     A candidate file is rejected outright if its filename similarity to the wishlist
     item falls below ``min_file_score``. This score compares against the *filename stem*
@@ -717,6 +743,10 @@ def pick_file(responses: list[dict], item: WishItem, min_file_score: float = 0.6
     the script downloads near-random files that can never reconcile back to
     ``available`` and so get re-downloaded every pass; too high and legitimately-named
     files with noisy stems get skipped.
+
+    The full ranked list (not just the winner) is returned so the caller can fall back
+    to the next source when the best one stalls or fails — the first entry is the same
+    file the old single-pick behaviour would have chosen.
     """
     target = track_key(item.artist, item.title)
     candidates: list[tuple[tuple, str, dict]] = []
@@ -746,11 +776,14 @@ def pick_file(responses: list[dict], item: WishItem, min_file_score: float = 0.6
                 -speed,
             )
             candidates.append((sort_key, username, f))
-    if not candidates:
-        return None
     candidates.sort(key=lambda c: c[0])
-    _, username, f = candidates[0]
-    return username, f
+    return [(username, f) for _key, username, f in candidates]
+
+
+def pick_file(responses: list[dict], item: WishItem, min_file_score: float = 0.6) -> Optional[tuple[str, dict]]:
+    """Best single (username, file) for an item, or None — a thin wrapper over rank_files."""
+    ranked = rank_files(responses, item, min_file_score)
+    return ranked[0] if ranked else None
 
 
 # --------------------------------------------------------------------------- #
@@ -760,58 +793,155 @@ def remote_basename(filename: str) -> str:
     return Path(filename.replace("\\", "/")).name
 
 
+@dataclass
+class DownloadAttempt:
+    """One wishlist item being downloaded, with its remaining fallback sources.
+
+    ``candidates`` is the ranked ``(username, file)`` list from :func:`rank_files`; the
+    head is the source currently enqueued and the tail is what we fall back to when it
+    stalls or fails. ``enqueued_at`` and ``last_bytes`` track the current source so a
+    download that is making progress isn't mistaken for a stalled one.
+    """
+
+    item: WishItem
+    candidates: list[tuple[str, dict]]
+    enqueued_at: float
+    last_bytes: int = 0
+
+    @property
+    def current(self) -> tuple[str, dict]:
+        return self.candidates[0]
+
+
+def _advance_to_next_source(
+    slskd: Slskd,
+    attempt: DownloadAttempt,
+    bad_transfer_id: Optional[str],
+) -> bool:
+    """Abandon the current source and enqueue the next viable fallback for ``attempt``.
+
+    Cancels the stalled/failed transfer (best-effort), drops every remaining candidate
+    from the *same* uploader — if that peer is offline or wedged, its other files will
+    stall too — then enqueues the best of what's left. Returns True if a fallback was
+    enqueued, False if the item has no usable sources left.
+    """
+    bad_user, _bad_file = attempt.current
+    if bad_transfer_id:
+        try:
+            slskd.cancel_download(bad_user, bad_transfer_id)
+        except RuntimeError:
+            pass  # best-effort; fall back regardless
+
+    rest = [c for c in attempt.candidates[1:] if c[0] != bad_user]
+    while rest:
+        username, f = rest[0]
+        try:
+            slskd.enqueue(username, [f])
+        except RuntimeError as exc:
+            print(f"  ! fallback enqueue from {username} failed: {exc}")
+            rest = rest[1:]
+            continue
+        attempt.candidates = rest
+        attempt.enqueued_at = time.monotonic()
+        attempt.last_bytes = 0
+        more = len(rest) - 1
+        print(
+            f"  + queued fallback {remote_basename(f['filename'])!r} from {username}"
+            + (f"  ({more} more source(s) available)" if more else "")
+        )
+        return True
+
+    # Nothing left to try. Keep the (dead) head so the timeout summary can name it.
+    attempt.candidates = [attempt.candidates[0]]
+    return False
+
+
 def wait_for_downloads(
     slskd: Slskd,
-    pending: list[tuple[str, dict, WishItem]],
+    attempts: list[DownloadAttempt],
     timeout: float,
+    per_download_timeout: float,
     poll: float = 3.0,
     on_downloaded: Optional["Callable[[WishItem], None]"] = None,
 ) -> tuple[int, int]:
-    """Poll slskd until the enqueued transfers finish, reporting each outcome.
+    """Poll slskd until the enqueued transfers finish, falling back on stalls/failures.
 
     slskd writes the files itself (into the dir it's configured with — your watch
     dir), so there's nothing to move; we just watch the transfer state for feedback.
 
+    For each item we watch its *current* source. If that source finishes, great. If it
+    **fails** (Errored/Cancelled/Rejected) or **stalls** — no bytes transferred for
+    ``per_download_timeout`` seconds, which is what a queued download behind an offline
+    or wedged uploader looks like — we cancel it and enqueue the next-best source
+    (:func:`_advance_to_next_source`). A download that is actively moving resets its own
+    stall clock, so a merely slow transfer is never abandoned. An item is only counted
+    as failed once *every* candidate source is exhausted.
+
     ``on_downloaded`` (if given) is called with the ``WishItem`` each time a transfer
     succeeds — used to flip that item to ``downloaded`` in pymix so it isn't
-    re-downloaded on the next pass. It's invoked once per item, right after the success
-    is observed, so a long wait still records progress as it happens.
+    re-downloaded on the next pass.
 
-    Returns (completed, failed). Anything still in flight when ``timeout`` elapses is
-    reported as timed out and counted as neither.
+    Returns (completed, failed). Anything still in flight when the overall ``timeout``
+    elapses is reported as timed out and counted as neither.
     """
-    remaining = {(u, remote_basename(f["filename"])): item for (u, f, item) in pending}
+    active = list(attempts)
     completed = 0
     failed = 0
     deadline = time.monotonic() + timeout
 
-    while remaining and time.monotonic() < deadline:
+    while active and time.monotonic() < deadline:
         time.sleep(poll)
-        # Group lookups by username to limit API calls.
-        for username in {u for (u, _name) in remaining}:
+        # One listing per uploader we're currently waiting on, reused across items.
+        listings: dict[str, Optional[list[dict]]] = {}
+        for username in {a.current[0] for a in active}:
             try:
-                files = slskd.downloads_for(username)
+                listings[username] = slskd.downloads_for(username)
             except RuntimeError:
-                continue
-            for f in files:
-                base = remote_basename(f.get("filename", ""))
-                state = str(f.get("state", ""))
-                key = (username, base)
-                if key not in remaining:
-                    continue
-                if "Completed" in state and "Succeeded" in state:
-                    print(f"  ✓ downloaded {base!r} from {username}")
-                    completed += 1
-                    item = remaining.pop(key, None)
-                    if item is not None and on_downloaded is not None:
-                        on_downloaded(item)
-                elif "Completed" in state and ("Errored" in state or "Cancelled" in state or "Rejected" in state):
-                    print(f"  ! transfer failed for {base!r} from {username}: {state}")
-                    failed += 1
-                    remaining.pop(key, None)
+                listings[username] = None  # transient; treat as "no news" this tick
 
-    for (username, base) in remaining:
-        print(f"  … timed out waiting for {base!r} from {username}")
+        still_active: list[DownloadAttempt] = []
+        for a in active:
+            username, f = a.current
+            base = remote_basename(f["filename"])
+            files = listings.get(username)
+            rec = None
+            if files is not None:
+                rec = next((x for x in files if remote_basename(x.get("filename", "")) == base), None)
+            state = str(rec.get("state", "")) if rec else ""
+            bytes_now = int((rec or {}).get("bytesTransferred", 0) or 0)
+
+            if "Completed" in state and "Succeeded" in state:
+                print(f"  ✓ downloaded {base!r} from {username}")
+                completed += 1
+                if on_downloaded is not None:
+                    on_downloaded(a.item)
+                continue
+
+            failed_transfer = "Completed" in state and any(
+                s in state for s in ("Errored", "Cancelled", "Rejected")
+            )
+            # Progress resets the stall clock so a slow-but-moving download survives.
+            if bytes_now > a.last_bytes:
+                a.last_bytes = bytes_now
+                a.enqueued_at = time.monotonic()
+            stalled = time.monotonic() - a.enqueued_at >= per_download_timeout
+
+            if failed_transfer or stalled:
+                reason = state if failed_transfer else f"no progress for {per_download_timeout:.0f}s"
+                print(f"  ↻ {base!r} from {username}: {reason}; trying next source")
+                if _advance_to_next_source(slskd, a, (rec or {}).get("id")):
+                    still_active.append(a)
+                else:
+                    print(f"  ✗ no more sources for {a.item.artist} - {a.item.title}")
+                    failed += 1
+                continue
+
+            still_active.append(a)
+        active = still_active
+
+    for a in active:
+        username, f = a.current
+        print(f"  … timed out waiting for {remote_basename(f['filename'])!r} from {username}")
     return completed, failed
 
 
@@ -872,7 +1002,17 @@ def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
                         "slskd usually completes its own search in ~15s and we stop as soon as "
                         "it does, so this is just an upper bound for slow/quiet queries.")
     p.add_argument("--download-timeout", type=float, default=600.0,
-                   help="Max seconds to wait for all transfers to finish.")
+                   help="Overall max seconds to wait for all transfers (across fallbacks) to finish.")
+    p.add_argument("--per-download-timeout", type=float, default=120.0,
+                   help="Seconds a single source may make no progress before it's abandoned "
+                        "for the next-best source. This is what breaks a stall on an offline or "
+                        "wedged uploader: a queued download that never sends a byte is cancelled "
+                        "and the next candidate tried. A download that is actively transferring "
+                        "resets this clock, so slow-but-moving transfers are never dropped.")
+    p.add_argument("--max-candidates", type=int, default=5,
+                   help="Max number of sources (uploaders) to try per item before giving up "
+                        "(0 = try every match the search returned). Fallbacks are attempted "
+                        "best-first, skipping other files from a source that just stalled.")
     p.add_argument("--no-wait", action="store_true",
                    help="Enqueue downloads and exit without waiting; slskd finishes them in the background.")
     p.add_argument("--watch", action="store_true",
@@ -973,8 +1113,13 @@ def run_once(
             line = f"- {it.artist} - {it.title}"
             if slskd:
                 try:
-                    chosen = pick_file(slskd.search(it.query, args.search_wait), it, args.min_file_score)
-                    line += f"  =>  {chosen[1]['filename']}" if chosen else "  =>  (no match found)"
+                    ranked = rank_files(slskd.search(it.query, args.search_wait), it, args.min_file_score)
+                    if ranked:
+                        line += f"  =>  {ranked[0][1]['filename']}"
+                        if len(ranked) > 1:
+                            line += f"  (+{len(ranked) - 1} fallback source(s))"
+                    else:
+                        line += "  =>  (no match found)"
                 except RuntimeError as exc:
                     line += f"  =>  (search failed: {exc})"
             print(line)
@@ -984,7 +1129,7 @@ def run_once(
     # 4. search + enqueue
     slskd = build_slskd(args)
     assert slskd is not None  # guaranteed: non-dry-run requires slskd credentials
-    pending: list[tuple[str, dict, WishItem]] = []
+    pending: list[DownloadAttempt] = []
     for it in missing:
         print(f"searching: {it.artist} - {it.title}")
         try:
@@ -992,18 +1137,24 @@ def run_once(
         except RuntimeError as exc:
             print(f"  ! search failed: {exc}")
             continue
-        chosen = pick_file(responses, it, args.min_file_score)
-        if not chosen:
+        candidates = rank_files(responses, it, args.min_file_score)
+        if args.max_candidates > 0:
+            candidates = candidates[: args.max_candidates]
+        if not candidates:
             print("  - no suitable file found")
             continue
-        username, f = chosen
+        username, f = candidates[0]
         try:
             slskd.enqueue(username, [f])
         except RuntimeError as exc:
             print(f"  ! enqueue failed: {exc}")
             continue
-        print(f"  + queued {remote_basename(f['filename'])} from {username}")
-        pending.append((username, f, it))
+        more = len(candidates) - 1
+        print(
+            f"  + queued {remote_basename(f['filename'])} from {username}"
+            + (f"  ({more} fallback source(s) available)" if more else "")
+        )
+        pending.append(DownloadAttempt(it, candidates, time.monotonic()))
 
     def mark_downloaded(item: WishItem) -> None:
         """Flip a pulled item to ``downloaded`` in pymix so it isn't re-fetched.
@@ -1029,14 +1180,17 @@ def run_once(
         if args.no_wait and pending:
             # Can't confirm completion in --no-wait, so mark optimistically: the
             # alternative is leaving them 'wishlist' and re-downloading them next pass.
-            for _u, _f, it in pending:
-                mark_downloaded(it)
+            # No fallback here either — with nobody watching, a stalled source can't be
+            # detected and retried; --no-wait trades that away for a fire-and-forget run.
+            for attempt in pending:
+                mark_downloaded(attempt.item)
             print("(--no-wait) slskd will finish these into its configured downloads dir.")
         return 0
 
     print("waiting for downloads to complete…")
     completed, failed = wait_for_downloads(
-        slskd, pending, args.download_timeout, on_downloaded=mark_downloaded
+        slskd, pending, args.download_timeout, args.per_download_timeout,
+        on_downloaded=mark_downloaded
     )
     print(f"\ndone: {completed} completed, {failed} failed.")
     return 0
