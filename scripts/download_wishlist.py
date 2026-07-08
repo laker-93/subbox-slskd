@@ -223,12 +223,27 @@ def http_request(
 
     req = urllib.request.Request(url, data=data, headers=headers, method=method)
     attempt = 0
+    redirects = 0
     while True:
         try:
             with urllib.request.urlopen(req, timeout=timeout, context=_ssl_context()) as resp:
                 raw = resp.read()
             break
         except urllib.error.HTTPError as exc:
+            # urllib only auto-follows redirects for GET/HEAD (and POST on 301/302/303);
+            # for any other method it raises the 3xx as an error. The prod proxy in front
+            # of *.sub-box.net answers a PATCH /wishlist/{id} with a 308 (path normalisation),
+            # which urllib refuses to follow — so we follow it ourselves, preserving method
+            # and body per RFC 7538 (308) / 7231 (307). A 303 means "GET the result", so we
+            # switch to GET and drop the body; other codes keep the original method.
+            if exc.code in (301, 302, 303, 307, 308) and exc.headers.get("Location") and redirects < 5:
+                redirects += 1
+                url = urllib.parse.urljoin(url, exc.headers["Location"])
+                exc.read()  # drain so the connection can be reused
+                if exc.code == 303:
+                    method, data = "GET", None
+                req = urllib.request.Request(url, data=data, headers=headers, method=method)
+                continue
             body = exc.read().decode("utf-8", "replace")
             raise RuntimeError(f"{method} {url} -> HTTP {exc.code}: {body[:500]}") from exc
         except OSError as exc:
