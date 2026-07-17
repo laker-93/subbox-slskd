@@ -165,7 +165,7 @@ _INSECURE_TLS = False
 # whose managed WAF rules block the stdlib default "Python-urllib/x.y" signature with
 # a 403 (Cloudflare error 1010, "banned based on your browser's signature"). Sending a
 # normal browser UA gets us past that check — the request still authenticates as usual
-# (username query param / session cookie); this only stops the WAF from refusing the
+# (the pymix session cookie); this only stops the WAF from refusing the
 # client outright. Per-call headers still win (e.g. the MusicBrainz UA below), so this
 # is only applied when a caller hasn't set its own User-Agent.
 _DEFAULT_USER_AGENT = (
@@ -197,8 +197,12 @@ def http_request(
     timeout: float = 30.0,
     retries: int = 4,
     retry_backoff: float = 1.0,
+    out_headers: Optional[dict] = None,
 ) -> Any:
     """Make an HTTP request and return parsed JSON (or ``None`` for empty bodies).
+
+    Pass ``out_headers`` to receive the response headers (needed by ``pymix_login``,
+    which wants the ``Set-Cookie`` the body doesn't carry).
 
     Raises ``RuntimeError`` with a readable message on non-2xx responses.
 
@@ -228,6 +232,11 @@ def http_request(
         try:
             with urllib.request.urlopen(req, timeout=timeout, context=_ssl_context()) as resp:
                 raw = resp.read()
+                if out_headers is not None:
+                    out_headers.clear()
+                    # Multi-valued headers (Set-Cookie) must not collapse to one entry.
+                    for key, value in resp.headers.items():
+                        out_headers.setdefault(key.lower(), []).append(value)
             break
         except urllib.error.HTTPError as exc:
             # urllib only auto-follows redirects for GET/HEAD (and POST on 301/302/303);
@@ -265,6 +274,30 @@ def http_request(
         return json.loads(raw)
     except json.JSONDecodeError:
         return raw.decode("utf-8", "replace")
+
+
+def pymix_login(pymix_url: str, username: str, password: str) -> str:
+    """Exchange a pymix username + password for a ``session_id``.
+
+    pymix identifies the wishlist owner solely by this cookie. It used to also accept a
+    plain ``?username=`` query param, but that was never checked against a credential —
+    naming a user was enough to read and write their wishlist — so it was removed and
+    this script has to log in like any other client.
+    """
+    headers: dict = {}
+    http_request(
+        "POST",
+        f"{pymix_url.rstrip('/')}/user/login",
+        json_body={"username": username, "password": password},
+        out_headers=headers,
+    )
+    for cookie in headers.get("set-cookie", []):
+        match = re.search(r"(?:^|;\s*)session_id=([^;]+)", cookie)
+        if match:
+            return match.group(1)
+    raise RuntimeError(
+        f"pymix login as {username!r} succeeded but returned no session_id cookie."
+    )
 
 
 # --------------------------------------------------------------------------- #
@@ -456,22 +489,17 @@ class WishItem:
 
 def fetch_wishlist(
     pymix_url: str,
-    username: Optional[str],
-    session_id: Optional[str],
+    session_id: str,
     status: str,
     use_musicbrainz_fallback: bool = True,
 ) -> list[WishItem]:
-    """GET {pymix_url}/wishlist filtered by status. Auth via username or session_id."""
-    params = {"status": status}
-    cookies = None
-    if username:
-        params["username"] = username
-    if session_id:
-        cookies = {"session_id": session_id}
-    if not username and not session_id:
-        raise RuntimeError("Provide --username or --session-id to identify the wishlist owner.")
-
-    data = http_request("GET", f"{pymix_url.rstrip('/')}/wishlist", params=params, cookies=cookies)
+    """GET {pymix_url}/wishlist filtered by status. Auth via the session_id cookie."""
+    data = http_request(
+        "GET",
+        f"{pymix_url.rstrip('/')}/wishlist",
+        params={"status": status},
+        cookies={"session_id": session_id},
+    )
     items = (data or {}).get("items", [])
     out: list[WishItem] = []
     for it in items:
@@ -534,24 +562,16 @@ WISHLIST_STATUS_DOWNLOADED = "downloaded"
 
 def set_wishlist_status(
     pymix_url: str,
-    username: Optional[str],
-    session_id: Optional[str],
+    session_id: str,
     wishlist_id: str,
     status: str,
 ) -> None:
     """PATCH {pymix_url}/wishlist/{wishlist_id} to set its status. Auth as fetch_wishlist."""
-    params = {}
-    cookies = None
-    if username:
-        params["username"] = username
-    if session_id:
-        cookies = {"session_id": session_id}
     http_request(
         "PATCH",
         f"{pymix_url.rstrip('/')}/wishlist/{urllib.parse.quote(wishlist_id)}",
-        params=params or None,
         json_body={"status": status},
-        cookies=cookies,
+        cookies={"session_id": session_id},
     )
 
 
@@ -996,7 +1016,8 @@ def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
     p.add_argument("--password", default=os.environ.get("PYMIX_PASSWORD"),
                    help="Subbox password (same login as the player; used to authenticate to Navidrome).")
     p.add_argument("--session-id", default=os.environ.get("PYMIX_SESSION_ID"),
-                   help="Optional pymix session_id cookie for the wishlist API (Navidrome still needs --username/--password).")
+                   help="Reuse an existing pymix session_id cookie instead of logging in "
+                        "with --username/--password.")
     p.add_argument("--status", default="wishlist",
                    help="Wishlist status to pull (items still wanting acquisition).")
     p.add_argument("--no-musicbrainz-fallback", action="store_true",
@@ -1102,10 +1123,18 @@ def run_once(
     looping, so a transient failure here (wishlist fetch, Navidrome ping) ends only
     the current pass, not the watcher.
     """
+    # 0. pymix session. Resolved per pass rather than once in main() so a long --watch
+    # run re-logs in instead of dying when the session expires.
+    try:
+        session_id = args.session_id or pymix_login(args.pymix_url, args.username, args.password)
+    except RuntimeError as exc:
+        print(f"error: could not authenticate with pymix: {exc}", file=sys.stderr)
+        return 1
+
     # 1. wishlist
     try:
         wishlist = fetch_wishlist(
-            args.pymix_url, args.username, args.session_id, args.status,
+            args.pymix_url, session_id, args.status,
             use_musicbrainz_fallback=not args.no_musicbrainz_fallback,
         )
     except RuntimeError as exc:
@@ -1204,7 +1233,7 @@ def run_once(
             return
         try:
             set_wishlist_status(
-                args.pymix_url, args.username, args.session_id,
+                args.pymix_url, session_id,
                 item.wishlist_id, WISHLIST_STATUS_DOWNLOADED,
             )
         except RuntimeError as exc:
